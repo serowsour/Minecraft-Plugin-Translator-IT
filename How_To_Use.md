@@ -21,7 +21,7 @@ Basic usage:
    -nobackup     Disable automatic backup creation
 
  Example:
-  python translate_serowsour.py -i en_US.yml -l it
+        python translate_serowsour.py -i en_US.yml -l it
 
  Output:
    Generates a translated YAML file named:
