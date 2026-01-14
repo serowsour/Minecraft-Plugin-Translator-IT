@@ -2,9 +2,12 @@
 # -*- coding: utf-8 -*-
 
 """
-translate_serowsour.py
-Script created by SerowSour
-A YAML translation and auto-repair tool.
+translate_serowsour_fixed.py
+Versione debug e migliorata:
+- barra di progresso per le fasi (mostra 👍 alla fine)
+- compatibility_check() per verificare l'ambiente
+- retry e fallback migliorati per i motori di traduzione
+- logging più dettagliato
 """
 
 import argparse
@@ -15,12 +18,13 @@ import shutil
 import sys
 import threading
 import time
+import socket
 from pathlib import Path
 from typing import Any, Dict
 
 import yaml
 
-# Attempt to import googletrans; fallback to deep-translator if available
+# Prova a importare googletrans, fallback a deep-translator se disponibile
 try:
     from googletrans import Translator as GTTranslator
 except Exception:
@@ -32,14 +36,14 @@ except Exception:
     DTTranslator = None
 
 # -----------------------
-# Configuration
+# Configurazione
 # -----------------------
 DEFAULT_LANG = "it"
-SPINNER_DELAY = 0.12
+PROGRESS_WIDTH = 36
 MAX_RETRIES = 3
-TRANSLATE_TIMEOUT = 10  # seconds per translation call
+TRANSLATE_TIMEOUT = 10  # secondi per chiamata di traduzione
+RETRY_BACKOFF = 1.5  # moltiplicatore backoff
 
-# Terms that must never be translated (Minecraft-specific vocabulary)
 MINECRAFT_TERMS = {
     "Land", "land", "Chunk", "Chunks", "chunk", "chunks", "Biome", "biomes",
     "Nether", "End", "Overworld", "PvP", "PVP", "Cooldown", "Cooldowns",
@@ -50,57 +54,32 @@ MINECRAFT_TERMS = {
 }
 LOWER_TERMS = {t.lower() for t in MINECRAFT_TERMS}
 
-# Regex for placeholders and protected tokens
 PLACEHOLDER_RE = re.compile(r"(\{[^}]+\}|%[^%\s]+%|\$[A-Za-z0-9_]+)")
-
-# Regex for Minecraft terms (case-insensitive)
 TERMS_PATTERN = re.compile(
     r"\b(" + "|".join(re.escape(t) for t in sorted(MINECRAFT_TERMS, key=len, reverse=True)) + r")\b",
     flags=re.IGNORECASE
 )
 
 # -----------------------
-# Spinner for console feedback
+# Progress bar per fasi
 # -----------------------
-_spinner_running = False
-_spinner_thread = None
-
-
-def spinner_start(message: str):
-    """Start a console spinner with a status message."""
-    global _spinner_running, _spinner_thread
-    if _spinner_running:
-        return
-    _spinner_running = True
-
-    def run():
-        chars = "|/-\\"
-        idx = 0
-        while _spinner_running:
-            sys.stdout.write(f"\r{message} {chars[idx % len(chars)]}")
-            sys.stdout.flush()
-            idx += 1
-            time.sleep(SPINNER_DELAY)
-        sys.stdout.write("\r" + " " * (len(message) + 4) + "\r")
+def progress_bar_phase(message: str, duration: float = 0.6):
+    """
+    Mostra una barra di progresso animata per la durata stimata.
+    Usala per dare feedback durante le fasi. Alla fine stampa 👍.
+    """
+    steps = PROGRESS_WIDTH
+    sys.stdout.write(f"{message} ")
+    sys.stdout.flush()
+    for i in range(steps + 1):
+        filled = i
+        bar = "█" * filled + "-" * (PROGRESS_WIDTH - filled)
+        percent = int((filled / PROGRESS_WIDTH) * 100)
+        sys.stdout.write(f"\r{message} [{bar}] {percent:3d}%")
         sys.stdout.flush()
-
-    _spinner_thread = threading.Thread(target=run, daemon=True)
-    _spinner_thread.start()
-
-
-def spinner_stop(final_message: str = ""):
-    """Stop the spinner and optionally print a final message."""
-    global _spinner_running, _spinner_thread
-    if not _spinner_running:
-        if final_message:
-            print(final_message)
-        return
-    _spinner_running = False
-    if _spinner_thread:
-        _spinner_thread.join(timeout=1)
-    if final_message:
-        print(final_message)
-
+        time.sleep(duration / max(1, steps))
+    sys.stdout.write("  👍\n")
+    sys.stdout.flush()
 
 # -----------------------
 # Logging
@@ -111,12 +90,10 @@ handler = logging.StreamHandler(sys.stdout)
 handler.setFormatter(logging.Formatter("%(asctime)s %(message)s", "%H:%M:%S"))
 logger.addHandler(handler)
 
-
 # -----------------------
 # File helpers
 # -----------------------
 def find_file(path_str: str) -> Path:
-    """Locate a file across common Termux/Android paths."""
     p = Path(path_str)
     if p.exists():
         return p
@@ -134,41 +111,31 @@ def find_file(path_str: str) -> Path:
 
 
 def backup_file(path: Path) -> Path:
-    """Create a backup copy of the file."""
     bak = path.with_suffix(path.suffix + ".bak")
     shutil.copy2(path, bak)
     return bak
 
 
 # -----------------------
-# YAML fixer (non-destructive)
+# YAML fixer (intelligente, non distruttivo)
 # -----------------------
 def fix_yaml_content(content: str) -> str:
-    """
-    Repair lines with unquoted values containing problematic characters.
-    Attempts to preserve indentation and comments.
-    """
     fixed_lines = []
     for line in content.splitlines():
         stripped = line.lstrip()
         indent = line[: len(line) - len(stripped)]
-
-        # Preserve comments and lines without ':'
         if stripped.startswith("#") or ":" not in stripped:
             fixed_lines.append(line)
             continue
 
-        # Split only on the first ':'
         key_part, val_part = stripped.split(":", 1)
         key = key_part.rstrip()
         val = val_part.lstrip()
 
-        # Leave empty, quoted, or block scalar values unchanged
         if val == "" or val.startswith(("'", '"')) or val.startswith("|") or val.startswith(">"):
             fixed_lines.append(line)
             continue
 
-        # Quote values containing problematic characters
         if any(c in val for c in ["&", ":", "'"]):
             if "'" in val and '"' not in val:
                 safe_val = "'" + val.replace("'", "''") + "'"
@@ -178,34 +145,30 @@ def fix_yaml_content(content: str) -> str:
             fixed_lines.append(new_line)
         else:
             fixed_lines.append(line)
-
     return "\n".join(fixed_lines)
 
 
 def load_yaml_with_fix(path: Path, make_backup: bool = True) -> Any:
-    """Load YAML, attempting automatic repair if parsing fails."""
     raw = path.read_text(encoding="utf-8")
     try:
         return yaml.safe_load(raw)
     except yaml.YAMLError as e:
-        logger.warning("Invalid YAML: %s", e)
+        logger.warning("YAML non valido: %s", e)
         if make_backup:
             bak = backup_file(path)
-            logger.info("Backup created: %s", bak.name)
-        logger.info("Attempting automatic YAML repair (pre-translation fix)...")
+            logger.info("Backup creato: %s", bak.name)
+        logger.info("Provo a correggere automaticamente il file YAML (pre-translation fix)...")
         fixed = fix_yaml_content(raw)
         try:
             return yaml.safe_load(fixed)
         except Exception as e2:
-            logger.error("Automatic repair failed: %s", e2)
+            logger.error("Correzione automatica fallita: %s", e2)
             raise
-
 
 # -----------------------
 # Masking / Unmasking
 # -----------------------
 def mask_text(text: str, mapping: Dict[str, str]) -> str:
-    """Replace placeholders and protected terms with tokens."""
     token_index = len(mapping)
 
     def repl_ph(m):
@@ -231,68 +194,72 @@ def mask_text(text: str, mapping: Dict[str, str]) -> str:
 
 
 def unmask_text(text: str, mapping: Dict[str, str]) -> str:
-    """Restore masked placeholders and terms."""
     for token, original in mapping.items():
         text = text.replace(token, original)
     return text
 
-
 # -----------------------
-# Translation engine with fallback and timeout
+# Traduttore con fallback e timeout migliorato
 # -----------------------
 def translate_via_googletrans(text: str, dest: str) -> str:
     if GTTranslator is None:
-        raise RuntimeError("googletrans not available")
+        raise RuntimeError("googletrans non disponibile")
     t = GTTranslator()
     res = t.translate(text, dest=dest)
-    return res.text
+    # googletrans può restituire oggetti diversi a seconda della versione
+    if hasattr(res, "text"):
+        return res.text
+    if isinstance(res, dict):
+        # alcune versioni possono restituire dict
+        return res.get("translatedText") or res.get("text") or str(res)
+    return str(res)
 
 
 def translate_via_deep_translator(text: str, dest: str) -> str:
     if DTTranslator is None:
-        raise RuntimeError("deep-translator not available")
+        raise RuntimeError("deep-translator non disponibile")
     return DTTranslator(source="auto", target=dest).translate(text)
 
 
 def translate_one(masked_text: str, dest: str, timeout: int = TRANSLATE_TIMEOUT) -> str:
     """
-    Attempt translation with timeout and fallback.
-    Returns the translated string or raises an exception.
+    Tenta la traduzione con più motori, retry e backoff.
+    Restituisce la stringa tradotta o solleva eccezione.
     """
-    def call_google():
-        return translate_via_googletrans(masked_text, dest)
-
-    def call_deep():
-        return translate_via_deep_translator(masked_text, dest)
-
-    attempts = []
+    engines = []
     if GTTranslator is not None:
-        attempts.append(call_google)
+        engines.append(("googletrans", translate_via_googletrans))
     if DTTranslator is not None:
-        attempts.append(call_deep)
+        engines.append(("deep-translator", translate_via_deep_translator))
 
-    if not attempts:
-        raise RuntimeError("No translation engine available (install googletrans or deep-translator)")
+    if not engines:
+        raise RuntimeError("Nessun motore di traduzione disponibile (installa googletrans o deep-translator)")
 
     last_exc = None
-    for fn in attempts:
-        try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-                fut = ex.submit(fn)
-                return fut.result(timeout=timeout)
-        except Exception as e:
-            last_exc = e
+    for name, fn in engines:
+        attempt = 0
+        backoff = 1.0
+        while attempt < MAX_RETRIES:
+            attempt += 1
+            try:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                    fut = ex.submit(fn, masked_text, dest)
+                    return fut.result(timeout=timeout)
+            except Exception as e:
+                last_exc = e
+                logger.debug("Motore %s attempt %d fallito: %s", name, attempt, e)
+                time.sleep(backoff)
+                backoff *= RETRY_BACKOFF
+        logger.info("Motore %s esaurito, passo al successivo", name)
     raise last_exc
 
-
 # -----------------------
-# Translation functions with masking, retry, and logging
+# Funzioni di traduzione con masking, retry e logging
 # -----------------------
 PROGRESS = {"translated": 0, "skipped": 0}
 
 
 def translate_string(s: str, dest: str, max_retries: int = MAX_RETRIES) -> str:
-    """Translate a single string with masking and retry logic."""
     if not isinstance(s, str) or not s.strip():
         PROGRESS["skipped"] += 1
         return s
@@ -300,6 +267,7 @@ def translate_string(s: str, dest: str, max_retries: int = MAX_RETRIES) -> str:
     mapping: Dict[str, str] = {}
     masked = mask_text(s, mapping)
 
+    # se il testo è solo placeholder/token, non tradurre
     if re.fullmatch(r"(?:(?:__PH\d+__)|(?:__MT\d+__))+", masked or ""):
         PROGRESS["skipped"] += 1
         return unmask_text(masked, mapping)
@@ -312,16 +280,15 @@ def translate_string(s: str, dest: str, max_retries: int = MAX_RETRIES) -> str:
             PROGRESS["translated"] += 1
             return final
         except Exception as e:
-            logger.debug("Attempt %d failed for string: %s", attempt, e)
+            logger.warning("Tentativo %d fallito per stringa: %s", attempt, e)
             last_result = unmask_text(masked, mapping)
             time.sleep(1)
-
     PROGRESS["skipped"] += 1
+    logger.info("Stringa saltata dopo %d tentativi", max_retries)
     return last_result
 
 
 def translate_value(val: Any, dest: str) -> Any:
-    """Recursively translate strings inside YAML structures."""
     if isinstance(val, str):
         return translate_string(val, dest)
     if isinstance(val, dict):
@@ -330,12 +297,10 @@ def translate_value(val: Any, dest: str) -> Any:
         return [translate_value(x, dest) for x in val]
     return val
 
-
 # -----------------------
-# Post-translation fixes
+# Post-fix: correzioni dopo traduzione
 # -----------------------
 def post_fix_translated_content(obj: Any) -> Any:
-    """Perform minimal non-destructive cleanup on translated content."""
     if isinstance(obj, str):
         s = obj
         s = s.replace("''", "’") if "''" in s else s
@@ -354,12 +319,10 @@ def post_fix_translated_content(obj: Any) -> Any:
         return [post_fix_translated_content(x) for x in obj]
     return obj
 
-
 # -----------------------
-# Final sanity check
+# Ultimo controllo (sanity)
 # -----------------------
 def final_sanity_check(obj: Any) -> bool:
-    """Verify that no unresolved tokens remain."""
     problems = []
 
     def walk(x, path="root"):
@@ -368,7 +331,7 @@ def final_sanity_check(obj: Any) -> bool:
             return
         if isinstance(x, str):
             if "__PH" in x or "__MT" in x:
-                problems.append(f"{path} contains unresolved tokens")
+                problems.append(f"{path} contiene token non sostituiti")
             return
         if isinstance(x, dict):
             for k, v in x.items():
@@ -381,35 +344,88 @@ def final_sanity_check(obj: Any) -> bool:
 
     walk(obj)
     if problems:
-        logger.warning("Final sanity check: issues detected:")
+        logger.warning("Final sanity check: problemi trovati:")
         for p in problems:
             logger.warning(" - %s", p)
         return False
     return True
 
+# -----------------------
+# Compatibility check
+# -----------------------
+def compatibility_check() -> Dict[str, Any]:
+    """
+    Controlla le dipendenze e l'ambiente e restituisce un dizionario con lo stato.
+    """
+    info = {}
+    info["python_version"] = sys.version.splitlines()[0]
+    info["platform"] = sys.platform
+    info["yaml_installed"] = True
+    info["googletrans_installed"] = GTTranslator is not None
+    info["deep_translator_installed"] = DTTranslator is not None
+
+    # semplice test di rete (DNS lookup)
+    try:
+        socket.gethostbyname("google.com")
+        info["network_ok"] = True
+    except Exception:
+        info["network_ok"] = False
+
+    # Termux detection
+    info["is_termux"] = any(p in sys.executable.lower() for p in ("com.termux", "/data/data/com.termux"))
+    # WSL detection
+    try:
+        with open("/proc/version", "r", encoding="utf-8") as f:
+            ver = f.read().lower()
+            info["is_wsl"] = "microsoft" in ver
+    except Exception:
+        info["is_wsl"] = False
+
+    return info
+
+def print_compatibility(info: Dict[str, Any]):
+    print("=== Compatibility check ===")
+    print(f"Python: {info['python_version']}")
+    print(f"Platform: {info['platform']}")
+    print(f"yaml installed: {'yes' if info.get('yaml_installed') else 'no'}")
+    print(f"googletrans installed: {'yes' if info.get('googletrans_installed') else 'no'}")
+    print(f"deep-translator installed: {'yes' if info.get('deep_translator_installed') else 'no'}")
+    print(f"Network DNS ok: {'yes' if info.get('network_ok') else 'no'}")
+    if info.get("is_termux"):
+        print("Environment: Termux detected. Note: Termux cannot build APKs.")
+    if info.get("is_wsl"):
+        print("Environment: WSL detected. You can install build tools inside WSL.")
+    print("===========================")
 
 # -----------------------
-# Main pipeline
+# Main flow (fasi a→f)
 # -----------------------
 def main():
-    parser = argparse.ArgumentParser(description="translate_serowsour.py - YAML translator with intelligent repair")
-    parser.add_argument("-i", "--input", required=True, help="Input YAML file")
-    parser.add_argument("-o", "--output", default=None, help="Output YAML file (default: input_LANG.yml)")
-    parser.add_argument("-l", "--lang", default=DEFAULT_LANG, help="Target language (e.g., it)")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logging")
-    parser.add_argument("-nobackup", action="store_true", help="Do not create automatic backup")
+    parser = argparse.ArgumentParser(description="translate_serowsour.py - traduttore YAML con correzione intelligente")
+    parser.add_argument("-i", "--input", required=True, help="File YAML di input")
+    parser.add_argument("-o", "--output", default=None, help="File YAML di output (default: input_LANG.yml)")
+    parser.add_argument("-l", "--lang", default=DEFAULT_LANG, help="Lingua di destinazione (es: it)")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Verbose console")
+    parser.add_argument("-nobackup", action="store_true", help="Non creare backup automatico")
+    parser.add_argument("--check", action="store_true", help="Esegui solo compatibility check")
     args = parser.parse_args()
 
-    print("Script created by SerowSour")
-
+    print("script made by SerowSour (fixed)")
     if args.verbose:
         logger.setLevel(logging.INFO)
     else:
         logger.setLevel(logging.WARNING)
 
+    # compatibility check
+    comp = compatibility_check()
+    print_compatibility(comp)
+    if args.check:
+        print("Eseguito compatibility check. Esco.")
+        return
+
     input_path = find_file(args.input)
     if not input_path:
-        print("❌ Input file not found:", args.input)
+        print("❌ File di input non trovato:", args.input)
         sys.exit(2)
 
     if args.output:
@@ -420,65 +436,60 @@ def main():
         output_name = f"{stem}_{args.lang}{suffix}"
         output_path = input_path.with_name(output_name)
 
-    # PHASE A
-    phase_msg = "PHASE A — Pre-processing (validating and repairing source YAML)"
-    spinner_start(phase_msg)
+    # FASE a
+    phase_msg = "FASE a) pre-fix (controllo e correzione file non tradotto)"
+    progress_bar_phase(phase_msg, duration=0.6)
     try:
         data = load_yaml_with_fix(input_path, make_backup=not args.nobackup)
     except Exception as e:
-        spinner_stop(f"{phase_msg} -> ERROR: unable to load YAML: {e}")
+        print(f"{phase_msg} -> ERRORE: impossibile caricare YAML: {e}")
         sys.exit(3)
-    spinner_stop(f"{phase_msg} -> OK")
 
-    # PHASE B
-    phase_msg = "PHASE B — Translation in progress"
-    spinner_start(phase_msg)
+    # FASE b
+    phase_msg = "FASE b) traduzione in corso"
+    progress_bar_phase(phase_msg, duration=0.8)
     try:
         translated = translate_value(data, args.lang)
     except Exception as e:
-        spinner_stop(f"{phase_msg} -> ERROR: {e}")
+        print(f"{phase_msg} -> ERRORE: {e}")
         sys.exit(4)
-    spinner_stop(f"{phase_msg} -> OK (translated: {PROGRESS['translated']}, skipped: {PROGRESS['skipped']})")
 
-    # PHASE C
-    phase_msg = "PHASE C — Post-processing (partial cleanup)"
-    spinner_start(phase_msg)
+    # FASE c
+    phase_msg = "FASE c) post-fix parziale (correzioni su traduzioni)"
+    progress_bar_phase(phase_msg, duration=0.5)
     try:
         translated = post_fix_translated_content(translated)
     except Exception as e:
-        spinner_stop(f"{phase_msg} -> ERROR: {e}")
+        print(f"{phase_msg} -> ERRORE: {e}")
         sys.exit(5)
-    spinner_stop(f"{phase_msg} -> OK")
 
-    # PHASE D
-    phase_msg = "PHASE D — Post-processing (final cleanup)"
-    spinner_start(phase_msg)
+    # FASE d
+    phase_msg = "FASE d) post-fix completo (sanity & cleanup)"
+    progress_bar_phase(phase_msg, duration=0.4)
     try:
+        # placeholder per eventuali correzioni estese
         pass
     except Exception as e:
-        spinner_stop(f"{phase_msg} -> ERROR: {e}")
+        print(f"{phase_msg} -> ERRORE: {e}")
         sys.exit(6)
-    spinner_stop(f"{phase_msg} -> OK")
 
-    # PHASE E
-    phase_msg = "PHASE E — Final integrity check"
-    spinner_start(phase_msg)
+    # FASE e
+    phase_msg = "FASE e) ultimo controllo (sanity)"
+    progress_bar_phase(phase_msg, duration=0.4)
     ok = final_sanity_check(translated)
-    spinner_stop(f"{phase_msg} -> {'OK' if ok else 'ISSUES DETECTED'}")
     if not ok:
-        logger.warning("Final integrity check detected issues. Review the log for details.")
+        logger.warning("Sono stati rilevati problemi nel controllo finale. Controlla il log.")
 
-    # Save output
+    # Salva output
     try:
         output_path.write_text(yaml.dump(translated, allow_unicode=True, sort_keys=False), encoding="utf-8")
-        print(f"Output file created: {output_path.name}")
+        print(f"File di output creato: {output_path.name}")
     except Exception as e:
-        logger.error("Output write error: %s", e)
-        print("❌ Error writing output file:", e)
+        logger.error("Errore scrittura output: %s", e)
+        print("❌ Errore scrivendo il file di output:", e)
         sys.exit(7)
 
-    print("Operation completed.")
-
+    print("Finish👍")
 
 if __name__ == "__main__":
     main()
